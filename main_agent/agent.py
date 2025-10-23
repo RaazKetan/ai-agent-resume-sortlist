@@ -1,19 +1,13 @@
-import os
 import io
-import asyncio
-from typing import Dict, Any
 import re
-
-# --- Google Cloud & API Imports ---
+import asyncio
 import google.auth
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
-
-# --- PDF Processing ---
 import PyPDF2
 
-# --- Agent Development Kit (ADK) Imports ---
+# --- ADK imports ---
 from google.adk.agents import Agent
 from google.adk.tools import FunctionTool
 
@@ -22,7 +16,7 @@ from google.adk.tools import FunctionTool
 def get_sheet_values_from_link(sheet_url: str, range_name: str = "A:H"):
     """
     Given a Google Sheet link, extracts its spreadsheet ID and fetches rows.
-    By default, reads columns A–H (schema of your form).
+    By default, reads columns A–H.
     """
     # Extract spreadsheetId from the URL
     match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_url)
@@ -30,14 +24,22 @@ def get_sheet_values_from_link(sheet_url: str, range_name: str = "A:H"):
         raise ValueError("Invalid Google Sheet link provided.")
     spreadsheet_id = match.group(1)
 
-    creds, _ = google.auth.default()
+    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
     service = build("sheets", "v4", credentials=creds)
-    sheet = service.spreadsheets()
 
-    # ✅ don't hardcode "Sheet1!" → just request A:H from the first sheet
-    result = sheet.values().get(
+    # ✅ Get the first sheet/tab name dynamically
+    metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    sheet_name = metadata["sheets"][0]["properties"]["title"]
+
+    # If caller already provided a sheet-qualified range (contains '!'), use it as-is
+    if "!" in range_name:
+        final_range = range_name
+    else:
+        final_range = f"{sheet_name}!{range_name}"
+
+    result = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
-        range=range_name
+        range=final_range
     ).execute()
 
     return result.get("values", [])
@@ -57,15 +59,15 @@ def extract_drive_id(url: str) -> str:
 
 
 def get_drive_service():
-    """Returns a Drive API service object using ADC."""
-    creds, _ = google.auth.default()
-    service = build('drive', 'v3', credentials=creds)
-    return service
+    """Returns a Drive API service object using ADC (gcloud auth login)."""
+    creds, _ = google.auth.default(
+        scopes=["https://www.googleapis.com/auth/drive.readonly"]
+    )
+    return build('drive', 'v3', credentials=creds)
 
 
-# --- 2. Tool Functions ---
-
-def read_pdf_content(file_id: str) -> Dict[str, Any]:
+# --- 2. PDF Reader Tool ---
+def read_pdf_content(file_id: str):
     """
     Reads the text content of a single PDF file from Google Drive using its file ID.
     Returns extracted text.
@@ -83,64 +85,49 @@ def read_pdf_content(file_id: str) -> Dict[str, Any]:
 
         file_handle.seek(0)
         reader = PyPDF2.PdfReader(file_handle)
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() or ""
+        text = "".join([page.extract_text() or "" for page in reader.pages])
 
         return {"status": "success", "text_content": text}
     except HttpError as e:
-        return {"status": "error", "error_message": f"An API error occurred: {e}"}
+        # 🚨 Instead of blocking, just return a skip marker
+        return {"status": "skip", "error_message": f"Cannot access file {file_id}: {e}"}
     except Exception as e:
-        return {"status": "error", "error_message": str(e)}
+        return {"status": "skip", "error_message": str(e)}
 
 
-# --- 3. Wrap as Tools ---
-
+# --- 3. Register Tools ---
 sheet_tool = FunctionTool(func=get_sheet_values_from_link)
 pdf_tool = FunctionTool(func=read_pdf_content)
 
 
 # --- 4. Define the Agent ---
-
 root_agent = Agent(
     name="resume_shortlist_agent",
     model="gemini-2.5-pro",
-    description="Shortlists strong candidates from resumes (PDFs linked in a Google Sheet) for specific roles.",
-    instruction="""
-    You are an intelligent recruitment assistant.
-    Your task is to shortlist candidates from a Google Sheet and their linked resumes.
-    
-    The Google Sheet contains the following columns:
-    - Timestamp
-    - Full Name
-    - Email Address
-    - Phone Number
-    - Upload your updated resume (Drive Link)
-    - Achievements worth mentioning (in bullet points)
-    - Role Interested in
-    - Why Google should hire you (in 3rd person, max 150 words)
+    description="Shortlists strong candidates from resumes (PDFs linked in a Google Sheet).",
+   instruction="""
+You are a recruitment assistant.
+Task: shortlist candidates from a Google Sheet and their linked resumes.
 
-    Workflow:
-    1. Use the `get_sheet_values_from_link` tool with the sheet link provided by the user.
-    2. For each row:
-        - Extract candidate details (name, email, phone, achievements, role).
-        - From the resume link column, extract the Google Drive file ID.
-        - Use `read_pdf_content` tool to extract resume text.
-    3. Filtering rules:
-        - Only consider candidates whose "Role Interested in" matches the role mentioned in the user’s query.
-        - Resumes should be strong, ideally 1 page, with clear sections on **skills, projects, and achievements**.
-        - Use the "Achievements worth mentioning" column in the sheet to further validate candidate strength.
-        - Discard candidates with weak or irrelevant achievements or poorly structured resumes.
-    4. Output:
-        - Provide a **shortlist of strong candidates** in structured format:
-            - Full Name
-            - Email
-            - Role Interested
-            - Key Achievements (from sheet + resume)
-            - Resume Strength Summary
-    5. If no candidate qualifies, clearly say "No strong candidates found matching the role."
-
-    Always prioritize clarity, conciseness, and relevance in your evaluation.
-    """,
+Rules:
+1. Use `get_sheet_values_from_link` to read rows.
+2. For each row:
+   - Extract candidate details.
+   - From the resume link column, extract Drive file ID.
+   - Use `read_pdf_content` to extract resume text.
+   - ⚠️ If the resume is not accessible, SKIP that candidate and continue.
+3. Apply filtering rules:
+   - Only consider candidates matching the role the user asks for.
+   - Prefer resumes with clear **skills, projects, achievements**.
+   - Cross-check achievements from the sheet.
+4. Output a shortlist with:
+   - Full Name
+   - Email
+   - Role Interested
+   - Key Achievements
+   - Resume Strength Summary
+   - (If skipped, mark candidate as "Resume inaccessible")
+""",
     tools=[sheet_tool, pdf_tool]
 )
+
